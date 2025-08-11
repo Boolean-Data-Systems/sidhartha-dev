@@ -12,7 +12,7 @@ from openai import OpenAI
 # ------------------------
 # CONFIGURATION
 # ------------------------
-TOGETHER_API_KEY = "c7d84ff0e20fc64a6fad1cb9ef83f83ef6086ccd899ca06adaf58af3c3dc7d03"
+
 TOGETHER_API_KEY = os.environ.get("TOGETHER_API_KEY")
 if not TOGETHER_API_KEY:
     st.error("Please set TOGETHER_API_KEY environment variable before running.")
