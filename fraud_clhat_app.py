@@ -5,14 +5,12 @@ from pathlib import Path
 from typing import List
 import numpy as np
 import faiss
-from datetime import datetime
 from sentence_transformers import SentenceTransformer
 from openai import OpenAI
 
 # ------------------------
 # CONFIGURATION
 # ------------------------
-
 TOGETHER_API_KEY = os.environ.get("TOGETHER_API_KEY")
 if not TOGETHER_API_KEY:
     st.error("Please set TOGETHER_API_KEY environment variable before running.")
@@ -28,9 +26,6 @@ client = OpenAI(
     api_key=TOGETHER_API_KEY
 )
 
-# Local embedding model (fast!)
-embed_model = SentenceTransformer("all-MiniLM-L6-v2")
-
 # ------------------------
 # FUNCTIONS
 # ------------------------
@@ -39,17 +34,35 @@ def load_claims(file_path: str) -> List[str]:
         data = f.read()
     return data.strip().split("---\n")
 
+@st.cache_resource
+def load_embed_model():
+    """Cache the SentenceTransformer model"""
+    return SentenceTransformer("all-MiniLM-L6-v2")
+
+embed_model = load_embed_model()
+
 def get_embedding_local(text: str) -> List[float]:
-    """Local embedding generator for speed."""
     return embed_model.encode(text).tolist()
 
-def build_faiss_index(embeddings: List[List[float]]) -> faiss.IndexFlatL2:
-    dim = len(embeddings[0])
+@st.cache_data
+def load_claims_cached() -> List[str]:
+    """Cache claims file loading"""
+    return load_claims(CLAIMS_FILE)
+
+@st.cache_resource
+def load_faiss_index(claims: List[str]) -> faiss.IndexFlatL2:
+    """Cache FAISS index build"""
+    if Path(CACHE_FILE).exists():
+        claim_embeddings = json.loads(Path(CACHE_FILE).read_text())
+    else:
+        claim_embeddings = [get_embedding_local(c) for c in claims]
+        Path(CACHE_FILE).write_text(json.dumps(claim_embeddings))
+    dim = len(claim_embeddings[0])
     index = faiss.IndexFlatL2(dim)
-    index.add(np.array(embeddings).astype("float32"))
+    index.add(np.array(claim_embeddings).astype("float32"))
     return index
 
-def search_claims(query: str, index: faiss.IndexFlatL2, claims: List[str], top_k: int = 5):
+def search_claims(query: str, index: faiss.IndexFlatL2, claims: List[str], top_k: int = 3):
     query_emb = np.array(get_embedding_local(query)).astype("float32").reshape(1, -1)
     distances, indices = index.search(query_emb, top_k)
     results = []
@@ -58,7 +71,8 @@ def search_claims(query: str, index: faiss.IndexFlatL2, claims: List[str], top_k
             results.append((claims[idx], dist))
     return results
 
-def generate_answer(context_chunks: List[str], question: str) -> str:
+def generate_answer_stream(context_chunks: List[str], question: str):
+    """Stream TogetherAI response instead of waiting"""
     context_text = "\n\n---\n\n".join(context_chunks)
     prompt = f"""
 You are an intelligent insurance claims assistant.
@@ -73,28 +87,20 @@ QUESTION:
 
 Answer:
 """
-    response = client.chat.completions.create(
+    response_stream = client.chat.completions.create(
         model="meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
         messages=[{"role": "user", "content": prompt}],
         max_tokens=500,
-        temperature=0.2
+        temperature=0.2,
+        stream=True
     )
-    return response.choices[0].message.content
+    return response_stream
 
 # ------------------------
 # LOAD DATA ONCE
 # ------------------------
-if "claims" not in st.session_state:
-    st.session_state.claims = load_claims(CLAIMS_FILE)
-
-if "faiss_index" not in st.session_state:
-    # Load or compute embeddings
-    if Path(CACHE_FILE).exists():
-        claim_embeddings = json.loads(Path(CACHE_FILE).read_text())
-    else:
-        claim_embeddings = [get_embedding_local(c) for c in st.session_state.claims]
-        Path(CACHE_FILE).write_text(json.dumps(claim_embeddings))
-    st.session_state.faiss_index = build_faiss_index(claim_embeddings)
+claims = load_claims_cached()
+faiss_index = load_faiss_index(claims)
 
 # ------------------------
 # SESSION STATE FOR CHATS
@@ -118,42 +124,23 @@ with st.sidebar:
         use_container_width=True
     )
 
-    # Footer icons
-    # st.markdown(
-    #     """
-    #     <div style="position: fixed; bottom: 15px; display: flex; gap: 14px;">
-    #         <a href="https://your-website.com" target="_blank">
-    #             <img src="https://cdn-icons-png.flaticon.com/512/841/841364.png" width="22">
-    #         </a>
-    #         <a href="https://youtube.com/yourchannel" target="_blank">
-    #             <img src="https://cdn-icons-png.flaticon.com/512/1384/1384060.png" width="22">
-    #         </a>
-    #         <a href="https://linkedin.com/in/yourprofile" target="_blank">
-    #             <img src="https://cdn-icons-png.flaticon.com/512/174/174857.png" width="22">
-    #         </a>
-    #         <a href="mailto:your@email.com" target="_blank">
-    #             <img src="https://cdn-icons-png.flaticon.com/512/561/561127.png" width="22">
-    #         </a>
-    #     </div>
-    #     """, unsafe_allow_html=True
-    # )
-
 # ------------------------
 # MAIN CHAT AREA
 # ------------------------
-st.title("💬AI-Powered Underwriting Assistant (Insurance) ")
+# ------------------------
+# MAIN CHAT AREA
+# ------------------------
+st.title("💬 AI-Powered Underwriting Assistant (Insurance)")
 
 if st.session_state.current_chat is None:
     current_messages = []
 else:
     current_messages = st.session_state.chats[st.session_state.current_chat]["messages"]
 
+# Render chat messages properly (user → bot → user → bot)
 for role, message in current_messages:
-    bubble_color = "#DCF8C6" if role == "user" else "#F1F0F0"
-    st.markdown(
-        f"<div style='background-color:{bubble_color}; padding:10px; border-radius:10px; margin:5px 0; max-width:70%;'>{message}</div>",
-        unsafe_allow_html=True
-    )
+    with st.chat_message("user" if role == "user" else "assistant"):
+        st.markdown(message)
 
 # ------------------------
 # FIXED BOTTOM INPUT BAR
@@ -167,17 +154,26 @@ if user_input:
         st.session_state.chats.append({"name": chat_name, "messages": []})
         st.session_state.current_chat = len(st.session_state.chats) - 1
 
-    # Append user message
+    # Append user message & render immediately
     st.session_state.chats[st.session_state.current_chat]["messages"].append(("user", user_input))
+    with st.chat_message("user"):
+        st.markdown(user_input)
 
-    # 1. Search relevant claims (fast local embeddings)
-    results = search_claims(user_input, st.session_state.faiss_index, st.session_state.claims, top_k=5)
+    # 1. Search relevant claims
+    results = search_claims(user_input, faiss_index, claims, top_k=3)
     context_chunks = [r[0] for r in results]
 
-    # 2. Generate AI answer
-    bot_reply = generate_answer(context_chunks, user_input)
+    # 2. Generate AI answer (streamed)
+    with st.chat_message("assistant"):
+        message_placeholder = st.empty()
+        full_reply = ""
+        for chunk in generate_answer_stream(context_chunks, user_input):
+            delta = getattr(chunk.choices[0].delta, "content", "")
+            if delta:
+                full_reply += delta
+                message_placeholder.markdown(full_reply + "▌")
+        message_placeholder.markdown(full_reply)
 
-    # Append bot reply
-    st.session_state.chats[st.session_state.current_chat]["messages"].append(("bot", bot_reply))
-
+    # Save bot reply
+    st.session_state.chats[st.session_state.current_chat]["messages"].append(("bot", full_reply))
     st.rerun()
